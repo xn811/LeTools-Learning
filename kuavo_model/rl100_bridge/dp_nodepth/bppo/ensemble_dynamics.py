@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import Callable, List, Tuple, Dict, Optional
-from rl_100.unidpg.transition_model.dynamics.base_dynamics import BaseDynamics
+from .base_dynamics import BaseDynamics
 
 from rl_100.common.pytorch_util import dict_apply
 
