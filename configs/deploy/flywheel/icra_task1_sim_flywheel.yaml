@@ -1,0 +1,59 @@
+output_root: /path/to/flywheel_output
+record:
+  expected_types:
+    /sensors_data_raw: kuavo_msgs/sensorsData
+    /joint_cmd: kuavo_msgs/jointCmd
+    /kuavo_arm_traj: sensor_msgs/JointState
+    /gripper/state: sensor_msgs/JointState
+    /gripper/command: sensor_msgs/JointState
+    /cam_h/color/image_raw/compressed: sensor_msgs/CompressedImage
+    /cam_l/color/image_raw/compressed: sensor_msgs/CompressedImage
+    /cam_r/color/image_raw/compressed: sensor_msgs/CompressedImage
+    /cam_h/depth/image_raw/compressedDepth: sensor_msgs/CompressedImage
+    /cam_l/depth/image_rect_raw/compressedDepth: sensor_msgs/CompressedImage
+    /cam_r/depth/image_rect_raw/compressedDepth: sensor_msgs/CompressedImage
+  topics:
+    - /sensors_data_raw
+    - /joint_cmd
+    - /kuavo_arm_traj
+    - /gripper/state
+    - /gripper/command
+    - /cam_h/color/image_raw/compressed
+    - /cam_l/color/image_raw/compressed
+    - /cam_r/color/image_raw/compressed
+    - /cam_h/depth/image_raw/compressedDepth
+    - /cam_l/depth/image_rect_raw/compressedDepth
+    - /cam_r/depth/image_rect_raw/compressedDepth
+  # The task success event is recorded in episode metadata by the collector.
+  # Keeping it outside the bag preserves the reference expert topic list.
+  required_topics:
+    - /sensors_data_raw
+    - /joint_cmd
+    - /kuavo_arm_traj
+    - /gripper/state
+    - /gripper/command
+    - /cam_h/color/image_raw/compressed
+    - /cam_l/color/image_raw/compressed
+    - /cam_r/color/image_raw/compressed
+    - /cam_h/depth/image_raw/compressedDepth
+    - /cam_l/depth/image_rect_raw/compressedDepth
+    - /cam_r/depth/image_rect_raw/compressedDepth
+  ready_timeout_seconds: 15
+  shutdown_timeout_seconds: 30
+  # Wall-clock recording after success; must be verified against actual sample_drop.
+  post_success_seconds: 3.0
+  init_timeout_seconds: 120
+  # Receipt-time watchdog. This does not establish policy-buffer freshness.
+  observation_topics:
+    - /sensors_data_raw
+    - /gripper/state
+    - /cam_h/color/image_raw/compressed
+    - /cam_l/color/image_raw/compressed
+    - /cam_r/color/image_raw/compressed
+    - /cam_h/depth/image_raw/compressedDepth
+    - /cam_l/depth/image_rect_raw/compressedDepth
+    - /cam_r/depth/image_rect_raw/compressedDepth
+  max_observation_age_seconds: 5
+  observation_ready_timeout_seconds: 15
+  # Bounds Python-level environment construction and reset, including buffer wait.
+  environment_init_timeout_seconds: 30
