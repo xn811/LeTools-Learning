@@ -83,9 +83,15 @@ class EnsembleDynamics_batch(BaseDynamics):
             raise ValueError(
                 "dynamics.rollout_mode must be 'stochastic' or 'elite_mean'."
             )
-        if self.terminal_mode not in {"external", "reward_threshold"}:
+        self.terminal_classifier = None
+        self.terminal_classifier_threshold = float(
+            getattr(cfg.dynamics, "terminal_classifier_threshold", 0.5)
+        )
+        if not 0.0 < self.terminal_classifier_threshold < 1.0:
+            raise ValueError("terminal_classifier_threshold must be between 0 and 1")
+        if self.terminal_mode not in {"external", "reward_threshold", "learned"}:
             raise ValueError(
-                "dynamics.terminal_mode must be 'external' or 'reward_threshold'."
+                "dynamics.terminal_mode must be 'external', 'reward_threshold', or 'learned'."
             )
         if (
             self.terminal_mode == "reward_threshold"
@@ -316,7 +322,14 @@ class EnsembleDynamics_batch(BaseDynamics):
             next_obs = samples
             reward = np.zeros((next_obs.shape[0], 1), dtype=np.float32)
 
-        if self.terminal_mode == "reward_threshold":
+        if self.terminal_mode == "learned":
+            if self.terminal_classifier is None:
+                raise RuntimeError("Learned terminal classifier is not initialized")
+            with torch.no_grad():
+                classifier_input = torch.as_tensor(obs_act, dtype=torch.float32, device=self.device)
+                probabilities = torch.sigmoid(self.terminal_classifier(classifier_input))
+            terminal = (probabilities.cpu().numpy() >= self.terminal_classifier_threshold)
+        elif self.terminal_mode == "reward_threshold":
             terminal = (reward >= self.terminal_reward_threshold).astype(np.bool_)
         else:
             terminal = self.terminal_fn(
@@ -914,6 +927,10 @@ class EnsembleDynamics_batch(BaseDynamics):
         # Handle DDP-wrapped models by saving the underlying module's state_dict
         model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
         torch.save(model_to_save.state_dict(), os.path.join(save_path, "dynamics.pth"))
+        if self.terminal_mode == "learned":
+            if self.terminal_classifier is None:
+                raise RuntimeError("Learned terminal classifier is not initialized")
+            torch.save(self.terminal_classifier.state_dict(), os.path.join(save_path, "terminal_classifier.pth"))
         print('dynamics model saved in {}'.format(str(save_path)))
 
     def load(self, load_path: str) -> None:
@@ -922,4 +939,12 @@ class EnsembleDynamics_batch(BaseDynamics):
         # Also handle _device access
         device = model._device if hasattr(model, '_device') else next(model.parameters()).device
         model.load_state_dict(torch.load(os.path.join(load_path, "dynamics.pth"), map_location=device))
+        if self.terminal_mode == "learned":
+            if self.terminal_classifier is None:
+                raise RuntimeError("Learned terminal classifier is not initialized")
+            self.terminal_classifier.load_state_dict(torch.load(
+                os.path.join(load_path, "terminal_classifier.pth"), map_location=device,
+                weights_only=True,
+            ))
+            self.terminal_classifier.eval()
         print('dynamics model loaded from {}'.format(str(load_path)))

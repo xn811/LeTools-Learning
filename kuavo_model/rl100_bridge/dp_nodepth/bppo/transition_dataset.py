@@ -128,16 +128,17 @@ class LeRobotDPNoDepthTransitionDataset(Dataset):
         self, episode_index: int, frame_index: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         terminal_frame = self.task.terminal_frame(episode_index)
+        terminal_reward = self.task.terminal_rewards[episode_index]
         rewards: list[float] = []
         not_done: list[float] = []
         returns: list[float] = []
         for offset in self.RL_OFFSETS:
             absolute_frame = frame_index + offset
             in_episode = 0 <= absolute_frame <= terminal_frame
-            rewards.append(1.0 if absolute_frame == terminal_frame else 0.0)
+            rewards.append(terminal_reward if absolute_frame == terminal_frame else 0.0)
             not_done.append(1.0 if absolute_frame < terminal_frame else 0.0)
             returns.append(
-                self.gamma ** (terminal_frame - absolute_frame)
+                terminal_reward * self.gamma ** (terminal_frame - absolute_frame)
                 if in_episode
                 else 0.0
             )

@@ -105,6 +105,13 @@ class OfflineBPPODPNoDepthWorkspace:
             excluded_episode_indices=list(cfg.task.excluded_episode_indices),
             video_backend=cfg.data.video_backend,
         )
+        if (str(cfg.dynamics.terminal_mode) == "reward_threshold"
+                and any(reward == 0.0 for reward in dataset.task.terminal_rewards.values())):
+            raise ValueError(
+                "Zero-reward failure terminals cannot be inferred by reward_threshold "
+                "dynamics; a separate terminal model or explicit horizon-aware rollout "
+                "is required before mixed-outcome BPPO training."
+            )
         # Keep CUDA modules out of DataLoader worker copies. The dataset API
         # still exposes the checkpoint-derived normalizer, but as a tiny CPU copy.
         dataset.set_normalizer(deepcopy(policy.normalizer).cpu())
@@ -115,6 +122,23 @@ class OfflineBPPODPNoDepthWorkspace:
         validation_count = max(
             1, int(round(len(episode_ids) * float(cfg.data.validation_fraction)))
         )
+        failures = [episode for episode in episode_ids
+                    if dataset.task.terminal_rewards[episode] == 0.0]
+        if failures and str(cfg.dynamics.terminal_mode) == "learned":
+            # Keep at least one zero-reward failure in the training partition.
+            # With only one failure it cannot also appear in validation.
+            validation_ids = episode_ids[:validation_count]
+            training_ids = episode_ids[validation_count:]
+            if not any(episode in failures for episode in training_ids):
+                failed = next(episode for episode in validation_ids if episode in failures)
+                replacement = next((episode for episode in training_ids
+                                    if episode not in failures), None)
+                if replacement is None:
+                    raise ValueError("Cannot put a failure episode in the training split")
+                episode_ids[episode_ids.index(failed)] = replacement
+                episode_ids[episode_ids.index(replacement, validation_count)] = failed
+            if len(failures) == 1:
+                LOG.warning("Only one failure episode: failure generalization cannot be validated")
         validation_episodes = set(episode_ids[:validation_count])
         train_episodes = set(episode_ids[validation_count:])
         train_indices = dataset.indices_for_episodes(train_episodes)
@@ -395,6 +419,9 @@ class OfflineBPPODPNoDepthWorkspace:
                     "terminal_reward_threshold": OmegaConf.select(
                         cfg, "dynamics.terminal_reward_threshold"
                     ),
+                    "terminal_classifier_threshold": float(OmegaConf.select(
+                        cfg, "dynamics.terminal_classifier_threshold", default=0.5
+                    )),
                 },
             }
         )
@@ -445,6 +472,39 @@ class OfflineBPPODPNoDepthWorkspace:
             n_action_steps=policy.n_action_steps,
             prediction_mode="full",
         )
+        terminal_optimizer = None
+        terminal_coverage_loader = None
+        if dynamics.terminal_mode == "learned":
+            dynamics.terminal_classifier = torch.nn.Sequential(
+                torch.nn.Linear(state_dim + chunk_action_dim, 256),
+                torch.nn.ReLU(),
+                torch.nn.Linear(256, 256),
+                torch.nn.ReLU(),
+                torch.nn.Linear(256, 1),
+            ).to(self.device)
+            terminal_optimizer = torch.optim.Adam(
+                dynamics.terminal_classifier.parameters(), lr=float(cfg.dynamics.lr)
+            )
+            # The dynamics batches may be capped for smoke tests. Guarantee the
+            # classifier sees each training episode's first and terminal center.
+            subset = train_loader.dataset
+            dataset = subset.dataset
+            episodes = dataset.base.hf_dataset["episode_index"]
+            frames = dataset.base.hf_dataset["frame_index"]
+            coverage_indices = [index for index in subset.indices
+                                if int(frames[index]) in (
+                                    0, dataset.task.terminal_frame(int(episodes[index]))
+                                )]
+            if not coverage_indices:
+                raise ValueError("No terminal classifier coverage samples")
+            terminal_coverage_loader = DataLoader(
+                Subset(dataset, coverage_indices), batch_size=int(cfg.training.batch_size),
+                shuffle=False, num_workers=0, drop_last=False,
+            )
+            LOG.warning(
+                "Learned terminal prediction is experimental; time-limit failures "
+                "cannot be inferred reliably from state alone without elapsed time."
+            )
 
         max_batches = cfg.training.max_batches_per_epoch
         best_losses = np.full(int(cfg.dynamics.ensemble_size), np.inf, dtype=np.float64)
@@ -487,6 +547,11 @@ class OfflineBPPODPNoDepthWorkspace:
         global_step = 0
         completed_epochs = 0
         stop_reason = "configured_epoch_limit_reached"
+        terminal_train_positive = 0
+        terminal_train_total = 0
+        terminal_validation_positive = 0
+        terminal_validation_total = 0
+        terminal_failure_centers_seen = 0
         for epoch in range(max_epochs):
             model.train()
             train_losses: list[float] = []
@@ -499,6 +564,22 @@ class OfflineBPPODPNoDepthWorkspace:
                     )
                 loss = dynamics.learn(batch, current, following)
                 dynamics.optimize(loss)
+                if terminal_optimizer is not None:
+                    inputs, _ = dynamics.format_samples_for_training(batch, current, following)
+                    last = policy.n_obs_steps - 1 + policy.n_action_steps - 1
+                    target = 1.0 - batch["not_done"][:, last].reshape(-1, 1)
+                    logits = dynamics.terminal_classifier(inputs.detach())
+                    terminal_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, target)
+                    terminal_optimizer.zero_grad()
+                    terminal_loss.backward()
+                    terminal_optimizer.step()
+                    terminal_train_positive += int(target.sum().item())
+                    terminal_train_total += int(target.numel())
+                    for episode, frame in zip(batch["episode_index"].tolist(),
+                                              batch["frame_index"].tolist(), strict=True):
+                        if (dataset.task.terminal_rewards[int(episode)] == 0.0
+                                and int(frame) == dataset.task.terminal_frame(int(episode))):
+                            terminal_failure_centers_seen += 1
                 train_loss = float(loss.detach().cpu().item())
                 train_losses.append(train_loss)
                 global_step += 1
@@ -525,6 +606,29 @@ class OfflineBPPODPNoDepthWorkspace:
                 if max_batches is not None and batch_index + 1 >= int(max_batches):
                     break
 
+            if terminal_coverage_loader is not None:
+                for batch in terminal_coverage_loader:
+                    batch = _move_to_device(batch, self.device)
+                    with torch.no_grad():
+                        current = dynamics.obs2latent(batch["obs"]).reshape(batch["action"].shape[0], -1)
+                        following = dynamics.next_obs2latent(batch["next_obs"]).reshape(batch["action"].shape[0], -1)
+                        inputs, _ = dynamics.format_samples_for_training(batch, current, following)
+                        last = policy.n_obs_steps - 1 + policy.n_action_steps - 1
+                        target = 1.0 - batch["not_done"][:, last].reshape(-1, 1)
+                    logits = dynamics.terminal_classifier(inputs.detach())
+                    terminal_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, target)
+                    terminal_optimizer.zero_grad()
+                    terminal_loss.backward()
+                    terminal_optimizer.step()
+                    terminal_train_positive += int(target.sum().item())
+                    terminal_train_total += int(target.numel())
+
+                    for episode, frame in zip(batch["episode_index"].tolist(),
+                                              batch["frame_index"].tolist(), strict=True):
+                        if (dataset.task.terminal_rewards[int(episode)] == 0.0
+                                and int(frame) == dataset.task.terminal_frame(int(episode))):
+                            terminal_failure_centers_seen += 1
+
             validation_losses: list[np.ndarray] = []
             validation_batch_sizes: list[int] = []
             reward_metric_totals = {
@@ -548,6 +652,11 @@ class OfflineBPPODPNoDepthWorkspace:
                         batch["action"].shape[0], -1
                     )
                     inputs, targets = dynamics.format_samples_for_training(batch, current, following)
+                    if terminal_optimizer is not None:
+                        last = policy.n_obs_steps - 1 + policy.n_action_steps - 1
+                        target = 1.0 - batch["not_done"][:, last].reshape(-1, 1)
+                        terminal_validation_positive += int(target.sum().item())
+                        terminal_validation_total += int(target.numel())
                     val_loss, reward_metrics = dynamics.validate_with_reward_metrics(
                         inputs, targets
                     )
@@ -666,6 +775,11 @@ class OfflineBPPODPNoDepthWorkspace:
         model.set_elites(elites)
         model.load_save()
         model.eval()
+        if terminal_optimizer is not None:
+            dynamics.terminal_classifier.eval()
+            LOG.info("Learned terminal samples: train_positive=%d/%d validation_positive=%d/%d",
+                     terminal_train_positive, terminal_train_total,
+                     terminal_validation_positive, terminal_validation_total)
         artifact_dir = self.run_dir / "rl100_modules" / "dynamics"
         artifact_dir.mkdir()
         dynamics.save(str(artifact_dir))
@@ -680,6 +794,14 @@ class OfflineBPPODPNoDepthWorkspace:
             "best_holdout_loss": float(best_holdout),
             "elite_indices": elites,
             "best_member_losses": [float(value) for value in best_losses],
+            "terminal_classifier": ({
+                "train_positive_samples": terminal_train_positive,
+                "train_samples": terminal_train_total,
+                "validation_positive_samples": terminal_validation_positive,
+                "validation_samples": terminal_validation_total,
+                "failure_terminal_centers_seen": terminal_failure_centers_seen,
+                "threshold": dynamics.terminal_classifier_threshold,
+            } if terminal_optimizer is not None else None),
             "metrics": {
                 "train_steps_csv": str(self.metrics_dir / "dynamics_train_steps.csv"),
                 "epochs_csv": str(self.metrics_dir / "dynamics_epochs.csv"),

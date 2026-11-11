@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 
 
 LABEL_SEMANTICS = "icra_task1_all_success_later_stable_gripper_release"
+FAILURE_LABEL_SEMANTICS = "icra_task1_failure_fixed_horizon_terminal"
 CSV_FIELDS = (
     "episode_index",
     "episode_length",
@@ -168,6 +169,7 @@ class ICRATask1ReleaseTerminal:
         self.excluded_episode_indices = frozenset(
             int(value) for value in excluded_episode_indices
         )
+        self.terminal_rewards: dict[int, float] = {}
         self.terminal_frames = self._load()
 
     @property
@@ -200,20 +202,29 @@ class ICRATask1ReleaseTerminal:
             for row in reader:
                 episode = int(row["episode_index"])
                 length = int(row["episode_length"])
-                left = int(row["left_stable_open_frame"])
-                right = int(row["right_stable_open_frame"])
                 terminal = int(row["terminal_frame"])
                 if episode in terminals or episode not in self.episode_lengths:
                     raise ValueError(f"Invalid/duplicate episode {episode}")
                 if length != self.episode_lengths[episode]:
                     raise ValueError(f"Episode {episode}: length mismatch")
-                if terminal != max(left, right) or not 0 <= terminal < length - 1:
-                    raise ValueError(f"Episode {episode}: invalid terminal frame")
-                if float(row["terminal_reward"]) != 1.0:
-                    raise ValueError(f"Episode {episode}: terminal reward must equal 1")
-                if row["label_semantics"] != LABEL_SEMANTICS:
-                    raise ValueError(f"Episode {episode}: unexpected label semantics")
+                reward = float(row["terminal_reward"])
+                if reward == 1.0 and row["label_semantics"] == LABEL_SEMANTICS:
+                    left = int(row["left_stable_open_frame"])
+                    right = int(row["right_stable_open_frame"])
+                    if terminal != max(left, right) or not 0 <= terminal < length - 1:
+                        raise ValueError(f"Episode {episode}: invalid success terminal frame")
+                elif reward == 0.0 and row["label_semantics"] == FAILURE_LABEL_SEMANTICS:
+                    if terminal != length - 1:
+                        raise ValueError(f"Episode {episode}: failure terminal must be final frame")
+                    if any(row[key].strip() for key in (
+                        "left_command_open_frame", "left_stable_open_frame",
+                        "right_command_open_frame", "right_stable_open_frame",
+                    )):
+                        raise ValueError(f"Episode {episode}: failure release fields must be empty")
+                else:
+                    raise ValueError(f"Episode {episode}: invalid reward or label semantics")
                 terminals[episode] = terminal
+                self.terminal_rewards[episode] = reward
 
         expected = set(self.episode_lengths) - set(self.excluded_episode_indices)
         if set(terminals) != expected:
